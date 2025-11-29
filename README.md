@@ -1,5 +1,8 @@
 # llm-threader
 
+[![npm version](https://img.shields.io/npm/v/llm-threader.svg)](https://www.npmjs.com/package/llm-threader)
+[![npm downloads](https://img.shields.io/npm/dm/llm-threader.svg)](https://www.npmjs.com/package/llm-threader)
+
 Efficiently run many local LLM calls on limited hardware without overheating or freezing your machine. `llm-threader` manages a thread pool where each thread is an LLM call, continuously monitors your system, and automatically adjusts concurrency to keep long-running and bursty workloads safe and fast.
 
 It intelligently scales the number of concurrent LLM calls up and down to prevent overheating and to find the fastest overall throughput for your hardware.
