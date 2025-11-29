@@ -1,0 +1,10 @@
+test/
+node_modules/
+*.log
+.DS_Store
+*.swp
+*.swo
+*~
+package-lock.json
+.git/
+.gitignore
