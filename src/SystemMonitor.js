@@ -55,6 +55,7 @@ export class SystemMonitor {
 
     this.onScalingUpdate = options.onScalingUpdate || null;
     this.getQueueMetrics = options.getQueueMetrics || null;
+    this._tickInFlight = false;
   }
 
   async getEnhancedSystemInfo() {
@@ -125,48 +126,57 @@ export class SystemMonitor {
   }
 
   async monitorSystemWithScaling() {
-    const systemInfo = await this.getEnhancedSystemInfo();
-    this.updateMetricsHistory(systemInfo);
-
-    let queueMetrics = {
-      queuePressure: 0,
-      activeThreads: this.monitoringState.currentThreadCount,
-      backlog: this.monitoringState.currentThreadCount,
-      operationMix: {},
-      operationMixWithContext: null,
-      throughput: null,
-      avgLatency: null,
-    };
-
-    if (this.getQueueMetrics) {
-      const externalMetrics = await this.getQueueMetrics();
-      if (externalMetrics && typeof externalMetrics === "object") {
-        queueMetrics = {
-          ...queueMetrics,
-          ...externalMetrics,
-        };
-      }
+    if (this._tickInFlight) {
+      return null;
     }
+    this._tickInFlight = true;
+
+    try {
+      const systemInfo = await this.getEnhancedSystemInfo();
+      this.updateMetricsHistory(systemInfo);
+
+      let queueMetrics = {
+        queuePressure: 0,
+        activeThreads: this.monitoringState.currentThreadCount,
+        backlog: this.monitoringState.currentThreadCount,
+        operationMix: {},
+        operationMixWithContext: null,
+        throughput: null,
+        avgLatency: null,
+      };
+
+      if (this.getQueueMetrics) {
+        const externalMetrics = await this.getQueueMetrics();
+        if (externalMetrics && typeof externalMetrics === "object") {
+          queueMetrics = {
+            ...queueMetrics,
+            ...externalMetrics,
+          };
+        }
+      }
 
     const throughput =
       queueMetrics.throughput !== undefined ? queueMetrics.throughput : null;
     const avgLatency =
       queueMetrics.avgLatency !== undefined ? queueMetrics.avgLatency : null;
+    const p95Latency =
+      queueMetrics.p95Latency !== undefined ? queueMetrics.p95Latency : null;
     const backlogSize =
       queueMetrics.backlog !== undefined
         ? queueMetrics.backlog
         : queueMetrics.queuePressure + queueMetrics.activeThreads;
 
-    this.scalingEngine.recordPerformanceData(
-      this.monitoringState.systemMetrics,
-      this.monitoringState.currentThreadCount,
-      queueMetrics.queuePressure,
-      queueMetrics.activeThreads,
-      queueMetrics.operationMix,
-      queueMetrics.operationMixWithContext,
+      this.scalingEngine.recordPerformanceData(
+        this.monitoringState.systemMetrics,
+        this.monitoringState.currentThreadCount,
+        queueMetrics.queuePressure,
+        queueMetrics.activeThreads,
+        queueMetrics.operationMix,
+        queueMetrics.operationMixWithContext,
       throughput,
       avgLatency,
-      backlogSize
+      backlogSize,
+      p95Latency
     );
 
     const scalingResult = await this.scalingEngine.findOptimalThreadCount(
@@ -179,50 +189,57 @@ export class SystemMonitor {
         gpu: this.emergencyThresholds.gpuUsage,
       },
       systemInfo.avgTemp >= this.emergencyThresholds.cpuTemp ||
-        systemInfo.cpuLoad >= this.emergencyThresholds.cpuUsage,
+        systemInfo.cpuLoad >= this.emergencyThresholds.cpuUsage ||
+        (systemInfo.avgGpuTemp || 0) >= this.emergencyThresholds.gpuTemp ||
+        (systemInfo.avgGpuUsage || 0) >= this.emergencyThresholds.gpuUsage,
       systemInfo.avgTemp >= this.highThresholds.cpuTemp ||
-        systemInfo.cpuLoad >= this.highThresholds.cpuUsage,
+        systemInfo.cpuLoad >= this.highThresholds.cpuUsage ||
+        (systemInfo.avgGpuTemp || 0) >= this.highThresholds.gpuTemp ||
+        (systemInfo.avgGpuUsage || 0) >= this.highThresholds.gpuUsage,
       queueMetrics.operationMixWithContext
     );
 
-    if (
-      !scalingResult ||
-      typeof scalingResult.recommendedThreads !== "number" ||
-      isNaN(scalingResult.recommendedThreads)
-    ) {
-      scalingResult.recommendedThreads = 1;
-      scalingResult.reason = "fallback_safety";
-      scalingResult.confidence = 0.5;
-    }
-
-    this.monitoringState.recommendedThreadCount =
-      scalingResult.recommendedThreads;
-    this.monitoringState.lastScalingDecision = {
-      timestamp: Date.now(),
-      recommendedThreads: scalingResult.recommendedThreads,
-      reason: scalingResult.reason,
-      confidence: scalingResult.confidence,
-    };
-
-    if (
-      this.monitoringState.currentThreadCount !==
-      scalingResult.recommendedThreads
-    ) {
-      const oldCount = this.monitoringState.currentThreadCount;
-      this.monitoringState.currentThreadCount =
-        scalingResult.recommendedThreads;
-
-      if (this.onScalingUpdate) {
-        this.onScalingUpdate(scalingResult.recommendedThreads, oldCount);
+      if (
+        !scalingResult ||
+        typeof scalingResult.recommendedThreads !== "number" ||
+        isNaN(scalingResult.recommendedThreads)
+      ) {
+        scalingResult.recommendedThreads = 1;
+        scalingResult.reason = "fallback_safety";
+        scalingResult.confidence = 0.5;
       }
-    }
 
-    return {
-      ...systemInfo,
-      currentThreadCount: this.monitoringState.currentThreadCount,
-      recommendedThreadCount: this.monitoringState.recommendedThreadCount,
-      scalingDecision: this.monitoringState.lastScalingDecision,
-    };
+      this.monitoringState.recommendedThreadCount =
+        scalingResult.recommendedThreads;
+      this.monitoringState.lastScalingDecision = {
+        timestamp: Date.now(),
+        recommendedThreads: scalingResult.recommendedThreads,
+        reason: scalingResult.reason,
+        confidence: scalingResult.confidence,
+      };
+
+      if (
+        this.monitoringState.currentThreadCount !==
+        scalingResult.recommendedThreads
+      ) {
+        const oldCount = this.monitoringState.currentThreadCount;
+        this.monitoringState.currentThreadCount =
+          scalingResult.recommendedThreads;
+
+        if (this.onScalingUpdate) {
+          this.onScalingUpdate(scalingResult.recommendedThreads, oldCount);
+        }
+      }
+
+      return {
+        ...systemInfo,
+        currentThreadCount: this.monitoringState.currentThreadCount,
+        recommendedThreadCount: this.monitoringState.recommendedThreadCount,
+        scalingDecision: this.monitoringState.lastScalingDecision,
+      };
+    } finally {
+      this._tickInFlight = false;
+    }
   }
 
   startContinuousMonitoring() {

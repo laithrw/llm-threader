@@ -2,23 +2,27 @@
 
 Efficiently run many local LLM calls on limited hardware without overheating or freezing your machine. `llm-threader` manages a thread pool where each thread is an LLM call, continuously monitors your system, and automatically adjusts concurrency to keep long-running and bursty workloads safe and fast.
 
-It intelligently scales the number of concurrent LLM calls up and down to prevent overheating and maximize throughput.
+It intelligently scales the number of concurrent LLM calls up and down to prevent overheating and to find the fastest overall throughput for your hardware.
 
-## Example use cases
+## Example Use Cases
 
 - **Consumer desktop apps with a local LLM**: e.g. a note-taking or coding assistant app that runs a local model for autocomplete, search, and summarization at the same time. You might fire off many LLM calls in parallel (multiple tabs, background indexing, long-running summaries), but you do **not** want the fan to spin up aggressively, the laptop to get hot, or the UI to freeze.
 - **Long-running or batch workloads**: e.g. processing a large document set or running many evaluations where you care about total completion time and need to respect thermal and memory limits on a single machine.
+
+## How It Improves Speed & Reliability
+
+On powerful hardware with many cores, running too few LLM calls at once wastes capacity, while running too many makes each call slower. `llm-threader` continuously measures throughput and latency at different concurrency levels and locks onto the thread count where **adding more threads would start to increase total completion time instead of reducing it**.
+
+On very limited machines (e.g. a MacBook Air), that sweet spot is often just 1–2 concurrent calls, so you should not expect large speedups—but it will still keep your system responsive and protect against freezes and crashes.
 
 ## Features
 
 - **Automatic Thread Scaling**: Dynamically adjusts concurrent request limits based on CPU/GPU usage and temperature
 - **Resource-Aware**: Monitors system metrics in real-time to prevent freezing, crashing, or otherwise overextending your hardware
 - **Priority Queue**: Supports priority-based request scheduling with emergency bypass
-- **Statistical Analysis**: Uses PID controllers, Bayesian optimization, and predictive scaling
-- **Cumulative-Time Optimization**: Automatically finds the thread count that minimizes total completion time when no manual cap is provided
+- **PID + Bayesian Optimization**: Combines PID control with a Bayesian optimizer to choose thread counts that balance throughput, tail latency, backlog, and safety margins (with a short observation window to avoid over-eager scaling)
+- **Adaptive Optimization**: When no manual cap is provided, it searches for the best throughput/latency tradeoff while respecting thermal/usage limits; exploration is unbounded by default (aside from safety/demand)
 - **Zero Configuration**: Works out of the box with sensible defaults
-
-On powerful hardware with many cores, running too few LLM calls at once wastes capacity, while running too many makes each call slower. `llm-threader` continuously measures throughput and latency at different concurrency levels and locks onto the thread count where **adding more threads would start to increase total completion time instead of reducing it**. On very limited machines (e.g. a MacBook Air), that sweet spot is often just 1–2 concurrent calls, so you should not expect large speedups—but it will still keep your system responsive and protect against freezes and crashes.
 
 ## Installation
 
@@ -71,12 +75,13 @@ Creates a new LLMThreader instance.
   - **History**: how much recent behavior is kept for analysis (`maxHistory*`, `maxDataPoints`)
   - **Safety limits**: when the system must back off to protect your machine from freezing or overheating (`emergencyAbsoluteLimits`, `highThresholds`)
 
-- `maxThreads` (number | null, default: null): Hard ceiling for concurrent threads. When omitted, llm-threader keeps scaling up until cumulative completion time starts to degrade, and then locks onto that optimal value.
+- `maxThreads` (number | null, default: null): Hard ceiling for concurrent threads. When omitted, llm-threader keeps exploring higher concurrency (bounded by safety limits and observed demand) until cumulative completion time starts to degrade, and then locks onto that optimal value.
 - `monitoringInterval` (number, default: 1000): How often, in milliseconds, the library samples CPU/GPU load, temperature, and memory (lower = reacts faster, higher = less overhead).
 - `onScalingUpdate` (function): Called whenever the recommended concurrent LLM call limit changes: `(newThreads, oldThreads) => void`.
 - `maxHistorySize` (number, default: 100): How many recent LLM requests are kept in the in-memory queue history used for throughput and latency stats.
 - `maxHistoryAgeMinutes` (number, default: 5): How many minutes of past system/load data are kept for trend analysis.
 - `maxDataPoints` (number, default: 300): Maximum number of sampled data points stored in the internal usage history window.
+- `scalingHistoryRetentionHours` (number, default: ~0.33): How many hours of scaling history to persist; defaults to ~20 minutes.
 - `emergencyAbsoluteLimits` (object): **Hard safety cutoffs**; if any of these are reached or exceeded, the engine immediately scales down concurrent LLM calls to protect your machine:
   - `cpuTemp` (number, default: 95): Maximum allowed CPU temperature in °C.
   - `cpuUsage` (number, default: 98): Maximum allowed average CPU usage percentage.
@@ -104,6 +109,8 @@ Executes an LLM operation through the thread pool.
 - `options` (object, optional):
   - `priority` (number, default: 0): Request priority (higher = more important)
   - `emergencyBypass` (boolean, default: false): Bypass normal queue limits
+  - `timeoutMs` (number, optional): Fail the request if it runs longer than this many milliseconds
+  - `signal` (AbortSignal, optional): Cancel the request when the signal aborts
 
 **Returns:** Promise that resolves with the operation result
 
@@ -138,6 +145,17 @@ Returns trend analysis of usage history:
 - `rateOfChange`: Rate of change per second for CPU and temperature
 - `dataPoints`: Number of data points analyzed
 - `timeSpan`: Time span of the analysis
+
+### Data persistence
+
+Usage and scaling history are stored in a small SQLite database under your OS-standard application data directory (e.g., `~/Library/Application Support/llm-threader`, `%LOCALAPPDATA%\\llm-threader`, or `~/.local/share/llm-threader`). If the database cannot be opened, the library falls back to in-memory history and logs a console warning.
+
+### How scaling decisions are made (high level)
+
+- Collect windowed throughput, p50/p95 latency, backlog, CPU/GPU usage/temperature.
+- PID sets a prior thread target; Bayesian optimization searches nearby thread counts using a reward that favors throughput and penalizes latency/backlog/thermal overages.
+- A brief observation period builds confidence before scaling up to avoid over-eager jumps; recommendations are capped by demand so threads aren’t left idle.
+- Hard safety limits (CPU/GPU temp/usage) always win; emergencies clamp to 1 thread.
 
 ### `threader.shutdown()`
 

@@ -46,6 +46,7 @@ export class LLMThreader {
       highThresholds: this.options.highThresholds,
       maxHistoryAgeMinutes: this.options.maxHistoryAgeMinutes,
       maxDataPoints: this.options.maxDataPoints,
+      scalingHistoryRetentionHours: this.options.scalingHistoryRetentionHours,
       onScalingUpdate: (newThreads, oldThreads) => {
         this.threadManager.updateThreadLimits(newThreads);
         if (this.options.onScalingUpdate) {
@@ -55,7 +56,7 @@ export class LLMThreader {
       getQueueMetrics: () => {
         const state = this.threadManager.getState();
         const stats = this.threadManager.getQueueStats();
-        const backlog = state.queueSize + state.activeRequests;
+        const backlog = stats.backlog;
         return {
           queuePressure: state.queueSize,
           activeThreads: state.activeRequests,
@@ -64,6 +65,7 @@ export class LLMThreader {
           operationMixWithContext: null,
           throughput: stats.throughput,
           avgLatency: stats.avgLatency,
+          p95Latency: stats.p95Latency,
         };
       },
     });

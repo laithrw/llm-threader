@@ -9,9 +9,6 @@
     "README.md",
     "LICENSE"
   ],
-  "scripts": {
-    "test": "node test/test.js"
-  },
   "keywords": [
     "llm",
     "threading",
@@ -24,13 +21,26 @@
     "concurrency",
     "performance"
   ],
-  "author": "Laith Weinberger <laithw@sas.upenn.edu>",
+  "author": "Laith Weinberger <laithweinberger@gmail.com>",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/laithrw/llm-threader.git"
+  },
+  "bugs": {
+    "url": "https://github.com/laithrw/llm-threader/issues"
+  },
+  "homepage": "https://github.com/laithrw/llm-threader#readme",
   "dependencies": {
     "bayesian-optimizer": "^1.2.0",
+    "better-sqlite3": "^9.4.0",
     "systeminformation": "^5.25.11"
   },
-  "devDependencies": {},
+  "devDependencies": {
+    "@langchain/community": "^0.3.0",
+    "@langchain/core": "^0.3.0",
+    "node-llama-cpp": "^3.10.0"
+  },
   "engines": {
     "node": ">=18.0.0"
   }

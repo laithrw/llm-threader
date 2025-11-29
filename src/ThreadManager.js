@@ -1,5 +1,5 @@
 class LLMRequest {
-  constructor(id, operation, priority = 0, emergencyBypass = false) {
+  constructor(id, operation, priority = 0, emergencyBypass = false, timeoutMs = null, abortSignal = null) {
     this.id = id;
     this.operation = operation;
     this.priority = priority;
@@ -9,6 +9,12 @@ class LLMRequest {
     this.status = "queued";
     this.result = null;
     this.error = null;
+    this.timeoutMs = timeoutMs;
+    this.abortSignal = abortSignal;
+    this.completionPromise = new Promise((resolve, reject) => {
+      this._resolve = resolve;
+      this._reject = reject;
+    });
   }
 
   start() {
@@ -20,12 +26,18 @@ class LLMRequest {
     this.status = "completed";
     this.endTime = Date.now();
     this.result = result;
+    if (this._resolve) {
+      this._resolve(result);
+    }
   }
 
   fail(error) {
     this.status = "failed";
     this.endTime = Date.now();
     this.error = error;
+    if (this._reject) {
+      this._reject(error);
+    }
   }
 
   getDuration() {
@@ -107,7 +119,7 @@ export class ThreadManager {
     this.lastUpdate = Date.now();
   }
 
-  queueRequest(operation, priority = 0, emergencyBypass = false) {
+  queueRequest(operation, priority = 0, emergencyBypass = false, timeoutMs = null, abortSignal = null) {
     const requestId = `req_${Date.now()}_${Math.random()
       .toString(36)
       .substr(2, 9)}`;
@@ -115,7 +127,9 @@ export class ThreadManager {
       requestId,
       operation,
       priority,
-      emergencyBypass
+      emergencyBypass,
+      timeoutMs,
+      abortSignal
     );
 
     if (emergencyBypass) {
@@ -192,12 +206,59 @@ export class ThreadManager {
       this.requestHistory.shift();
     }
 
-    Promise.resolve(request.operation())
+    const operationPromise = Promise.resolve()
+      .then(() => request.operation())
       .then((result) => {
         this.completeRequest(request.id, result);
+        return result;
       })
       .catch((error) => {
         this.failRequest(request.id, error);
+        throw error;
+      });
+
+    const timeoutPromise =
+      typeof request.timeoutMs === "number" && request.timeoutMs > 0
+        ? new Promise((_, reject) => {
+            request._timeoutId = setTimeout(() => {
+              reject(new Error("Request timed out"));
+            }, request.timeoutMs);
+          })
+        : null;
+
+    const abortPromise =
+      request.abortSignal instanceof AbortSignal
+        ? new Promise((_, reject) => {
+            if (request.abortSignal.aborted) {
+              reject(request.abortSignal.reason || new Error("Aborted"));
+            }
+            const onAbort = () => {
+              reject(request.abortSignal.reason || new Error("Aborted"));
+            };
+            request.abortSignal.addEventListener("abort", onAbort, {
+              once: true,
+            });
+            request._cleanupAbort = () =>
+              request.abortSignal.removeEventListener("abort", onAbort);
+          })
+        : null;
+
+    const races = [operationPromise];
+    if (timeoutPromise) races.push(timeoutPromise);
+    if (abortPromise) races.push(abortPromise);
+
+    Promise.race(races)
+      .then((result) => result)
+      .catch((error) => {
+        this.failRequest(request.id, error);
+      })
+      .finally(() => {
+        if (request._timeoutId) {
+          clearTimeout(request._timeoutId);
+        }
+        if (request._cleanupAbort) {
+          request._cleanupAbort();
+        }
       });
   }
 
@@ -272,34 +333,46 @@ export class ThreadManager {
   }
 
   findRequest(requestId) {
-    return this.requestHistory.find(
+    const activeMatch = this.requestHistory.find(
       (req) => req.id === requestId && req.status === "active"
     );
+    if (activeMatch) return activeMatch;
+    return this.requestQueue.find((req) => req.id === requestId);
   }
 
   async execute(operation, options = {}) {
-    const { priority = 0, emergencyBypass = false } = options;
-    const request = this.queueRequest(operation, priority, emergencyBypass);
+    const {
+      priority = 0,
+      emergencyBypass = false,
+      timeoutMs = null,
+      signal = null,
+    } = options;
 
-    while (request.status === "queued") {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    const request = this.queueRequest(
+      operation,
+      priority,
+      emergencyBypass,
+      timeoutMs,
+      signal
+    );
 
-    if (request.status !== "active") {
-      throw new Error(`Request ${request.id} was not started properly`);
-    }
+    const cancellation = (err) => {
+      // If still queued, remove it
+      const idx = this.requestQueue.indexOf(request);
+      if (idx >= 0) {
+        this.requestQueue.splice(idx, 1);
+        request.fail(err);
+        return Promise.reject(err);
+      }
+      this.failRequest(request.id, err);
+      throw err;
+    };
 
-    while (request.status === "active") {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    const resultPromise = request.completionPromise.catch((err) =>
+      cancellation(err)
+    );
 
-    if (request.status === "completed") {
-      return request.result;
-    } else if (request.status === "failed") {
-      throw request.error || new Error("Request failed");
-    } else {
-      throw new Error(`Unexpected request status: ${request.status}`);
-    }
+    return resultPromise;
   }
 
   getState() {
@@ -324,28 +397,50 @@ export class ThreadManager {
       (req) => req.status === "failed"
     );
 
+    const durations = completedRequests.map((req) => req.getDuration());
     const avgDuration =
-      completedRequests.length > 0
-        ? completedRequests.reduce((sum, req) => sum + req.getDuration(), 0) /
-          completedRequests.length
+      durations.length > 0
+        ? durations.reduce((sum, d) => sum + d, 0) / durations.length
         : 0;
 
-    const recentCompleted = completedRequests
-      .filter((req) => req.endTime && Date.now() - req.endTime < 60000)
-      .slice(-20);
+    const sortedDurations = durations.slice().sort((a, b) => a - b);
+    const p50 =
+      sortedDurations.length > 0
+        ? sortedDurations[Math.floor(sortedDurations.length * 0.5)]
+        : 0;
+    const p95 =
+      sortedDurations.length > 0
+        ? sortedDurations[Math.floor(sortedDurations.length * 0.95)]
+        : 0;
 
-    const throughput =
-      recentCompleted.length > 0 ? recentCompleted.length / 60 : 0;
+    const recentWindowMs = 60000;
+    const recentCompleted = completedRequests.filter(
+      (req) => req.endTime && Date.now() - req.endTime < recentWindowMs
+    );
+    let throughput = 0;
+    if (recentCompleted.length > 0) {
+      const oldest = recentCompleted.reduce(
+        (min, req) => Math.min(min, req.endTime || Date.now()),
+        Date.now()
+      );
+      const windowSeconds = Math.max((Date.now() - oldest) / 1000, 1);
+      throughput = recentCompleted.length / windowSeconds;
+    }
+
+    const avgLatency = avgDuration;
 
     return {
       active: activeRequests.length,
       completed: completedRequests.length,
       failed: failedRequests.length,
       queued: this.requestQueue.length,
+      backlog: this.requestQueue.length + this.activeRequests,
       avgDuration: avgDuration,
       maxConcurrent: this.maxConcurrentRequests,
       throughput,
-      avgLatency: avgDuration,
+      avgLatency,
+      p50Latency: p50,
+      p95Latency: p95,
     };
   }
 }
