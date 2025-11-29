@@ -1,6 +1,6 @@
 {
   "name": "llm-threader",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Intelligent thread pooling and scaling for local LLM requests based on CPU and GPU usage",
   "main": "src/index.js",
   "type": "module",
